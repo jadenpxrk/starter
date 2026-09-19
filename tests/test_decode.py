@@ -23,6 +23,12 @@ spec = importlib.util.spec_from_file_location(
 decode_attention = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(decode_attention)
 
+spec = importlib.util.spec_from_file_location(
+    'mlp', Path(__file__).resolve().parents[1] / 'engine/mlp.py',
+)
+mlp = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mlp)
+
 
 def tiny_model(dtype=torch.float32):
     config = Qwen3Config(
@@ -46,6 +52,7 @@ class DecodeTests(unittest.TestCase):
                 self.assertIs(ALL_ATTENTION_FUNCTIONS['sdpa'], sdpa_attention_forward)
                 self.assertEqual(model.config._attn_implementation, 'sdpa')
                 for layer in candidate.model.layers:
+                    layer.mlp = mlp.PackedMLP(layer.mlp)
                     self.assertIs(
                         ALL_ATTENTION_FUNCTIONS[layer.self_attn.config._attn_implementation],
                         decode_attention.grouped_decode_attention,

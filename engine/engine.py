@@ -6,6 +6,7 @@ from transformers import AutoModelForCausalLM
 from decode import DecodeState
 from decode_attention import install_decode_attention
 from kernels.rmsnorm import rms_norm
+from mlp import PackedMLP
 
 
 class FusedRMSNorm(torch.nn.Module):
@@ -41,6 +42,7 @@ class Engine:
             layer.post_attention_layernorm = FusedRMSNorm(layer.post_attention_layernorm)
             layer.self_attn.q_norm = FusedRMSNorm(layer.self_attn.q_norm)
             layer.self_attn.k_norm = FusedRMSNorm(layer.self_attn.k_norm)
+            layer.mlp = PackedMLP(layer.mlp)
         self.decode_state = None
 
     def generate(self, input_ids: list[list[int]], max_new_tokens: int):
