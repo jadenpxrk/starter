@@ -1,3 +1,4 @@
+from copy import deepcopy
 import importlib.util
 from pathlib import Path
 import sys
@@ -6,6 +7,8 @@ import unittest
 
 import torch
 from transformers import Qwen3Config, Qwen3ForCausalLM
+from transformers.integrations.sdpa_attention import sdpa_attention_forward
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 
 spec = importlib.util.spec_from_file_location(
@@ -13,6 +16,12 @@ spec = importlib.util.spec_from_file_location(
 )
 decode = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(decode)
+
+spec = importlib.util.spec_from_file_location(
+    'decode_attention', Path(__file__).resolve().parents[1] / 'engine/decode_attention.py',
+)
+decode_attention = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(decode_attention)
 
 
 def tiny_model(dtype=torch.float32):
@@ -32,8 +41,17 @@ class DecodeTests(unittest.TestCase):
         with torch.inference_mode():
             for dtype in (torch.float32, torch.bfloat16):
                 model = tiny_model(dtype)
+                candidate = deepcopy(model)
+                decode_attention.install_decode_attention(candidate)
+                self.assertIs(ALL_ATTENTION_FUNCTIONS['sdpa'], sdpa_attention_forward)
+                self.assertEqual(model.config._attn_implementation, 'sdpa')
+                for layer in candidate.model.layers:
+                    self.assertIs(
+                        ALL_ATTENTION_FUNCTIONS[layer.self_attn.config._attn_implementation],
+                        decode_attention.grouped_decode_attention,
+                    )
                 for batch, length, count in ((1, 1, 2), (2, 7, 5), (4, 13, 1)):
-                    state = decode.DecodeState(model, batch, length, count)
+                    state = decode.DecodeState(candidate, batch, length, count)
                     buffers = state.cache.key_cache + state.cache.value_cache
                     addresses = [tensor.data_ptr() for tensor in buffers]
                     for attempt in range(2):

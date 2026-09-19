@@ -4,6 +4,7 @@ import torch
 from transformers import AutoModelForCausalLM
 
 from decode import DecodeState
+from decode_attention import install_decode_attention
 from kernels.rmsnorm import rms_norm
 
 
@@ -32,6 +33,7 @@ class Engine:
             .eval()
             .to("cuda:0")
         )
+        install_decode_attention(self.model)
         base = self.model.model
         base.norm = FusedRMSNorm(base.norm)
         for layer in base.layers:
