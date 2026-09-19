@@ -1,14 +1,19 @@
-"""Native Qwen3 4B engine: the starter, and a complete submission as it is.
-
-Loads the pinned checkpoint with Transformers and decodes greedily with a KV
-cache. Submit unchanged to measure starting throughput, then improve it:
-cache layout, CUDA graphs, fused kernels, chunked prefill, speculative decoding
-with exact verification. What you may not change is the answer: every token
-must be the one native Qwen picks, judged by a teacher-forced replay.
-"""
+"""Qwen3 4B greedy decoding with fused Triton RMSNorm."""
 
 import torch
 from transformers import AutoModelForCausalLM
+
+from kernels.rmsnorm import rms_norm
+
+
+class FusedRMSNorm(torch.nn.Module):
+    def __init__(self, reference):
+        super().__init__()
+        self.weight = reference.weight
+        self.variance_epsilon = reference.variance_epsilon
+
+    def forward(self, x):
+        return rms_norm(x, self.weight, self.variance_epsilon)
 
 
 class Engine:
@@ -26,6 +31,13 @@ class Engine:
             .eval()
             .to("cuda:0")
         )
+        base = self.model.model
+        base.norm = FusedRMSNorm(base.norm)
+        for layer in base.layers:
+            layer.input_layernorm = FusedRMSNorm(layer.input_layernorm)
+            layer.post_attention_layernorm = FusedRMSNorm(layer.post_attention_layernorm)
+            layer.self_attn.q_norm = FusedRMSNorm(layer.self_attn.q_norm)
+            layer.self_attn.k_norm = FusedRMSNorm(layer.self_attn.k_norm)
 
     def generate(self, input_ids: list[list[int]], max_new_tokens: int):
         """Greedy continuation of every sequence, one step at a time.
