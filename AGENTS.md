@@ -131,6 +131,22 @@ where you record what each edit did and decide the next change; the hidden
 scores are the only ones that count, and they move for reasons the public
 three will not always show you.
 
+## Pro implementation and handoffs
+
+GPT-6 Astra Pro in the ChatGPT web app authors optimization designs and patches.
+Codex reviews, integrates, validates, submits, and collects benchmark feedback.
+Do not independently author the next optimization or use a model API unless the
+user changes this workflow.
+
+After every completed run, record the result and provide a complete, ready-to-send
+Pro handoff in the same response, without waiting for the user to ask. Include
+the repository and exact commit, previous and current official scores, all
+available public throughput/TTFT/TPOT/memory metrics, failures, executed and
+skipped checks, evidence gaps, and hard constraints including no quantization.
+Request a complete patch and focused runnable checks; let Pro choose the next
+optimization rather than prescribing a solution. Prepare source context while
+the run is pending so the handoff is ready promptly when results arrive.
+
 ## Failure codes
 
 `incorrect_output`, `candidate_error`, `timeout`, `latency_limit`,
