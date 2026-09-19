@@ -27,6 +27,11 @@ Break one of these and the run fails outright; no amount of speed compensates.
    pure-Python or Triton source in `engine/`.
 5. **`engine/` holds only what the engine imports.** Agent code, notes,
    experiment logs and results belong outside it.
+6. **No additional quantization. It disqualifies the submission.** Do not
+   quantize weights, activations, or the KV cache, including with TurboQuant,
+   FP8, INT8, or INT4. Preserve the reference's BF16/FP32 precision and cast
+   boundaries. Passing token checks or using exact verification does not waive
+   this rule.
 
 ## The gates
 

@@ -1,8 +1,9 @@
-"""Qwen3 4B greedy decoding with fused Triton RMSNorm."""
+"""Qwen3 4B greedy decoding with fused RMSNorm and CUDA graph replay."""
 
 import torch
 from transformers import AutoModelForCausalLM
 
+from decode import DecodeState
 from kernels.rmsnorm import rms_norm
 
 
@@ -38,6 +39,7 @@ class Engine:
             layer.post_attention_layernorm = FusedRMSNorm(layer.post_attention_layernorm)
             layer.self_attn.q_norm = FusedRMSNorm(layer.self_attn.q_norm)
             layer.self_attn.k_norm = FusedRMSNorm(layer.self_attn.k_norm)
+        self.decode_state = None
 
     def generate(self, input_ids: list[list[int]], max_new_tokens: int):
         """Greedy continuation of every sequence, one step at a time.
@@ -46,17 +48,19 @@ class Engine:
         exactly max_new_tokens times. Every sequence has the same length.
         Never stops at end-of-sequence tokens.
         """
-        current = torch.tensor(input_ids, dtype=torch.int64, device="cuda:0")
-        cache = None
+        if max_new_tokens <= 0:
+            return
         with torch.inference_mode():
-            for _ in range(max_new_tokens):
-                output = self.model(
-                    input_ids=current,
-                    past_key_values=cache,
-                    use_cache=True,
-                    logits_to_keep=1,
-                    return_dict=True,
-                )
-                current = output.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-                cache = output.past_key_values
-                yield current[:, 0].tolist()
+            prompt = torch.tensor(input_ids, dtype=torch.int64, device="cuda:0")
+            shape = (prompt.shape[0], prompt.shape[1], max_new_tokens)
+            if self.decode_state is None or self.decode_state.shape != shape:
+                self.decode_state = None
+                self.decode_state = DecodeState(self.model, *shape)
+            state = self.decode_state
+            state.prefill(prompt)
+            if max_new_tokens > 1 and state.graph is None:
+                state.capture()
+            yield state.tokens[:, 0].tolist()
+            for _ in range(max_new_tokens - 1):
+                state.graph.replay()
+                yield state.tokens[:, 0].tolist()
