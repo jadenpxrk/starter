@@ -66,7 +66,4 @@ class Engine:
             state.prefill(prompt)
             if max_new_tokens > 1 and state.graph is None:
                 state.capture()
-            yield state.tokens[:, 0].tolist()
-            for _ in range(max_new_tokens - 1):
-                state.graph.replay()
-                yield state.tokens[:, 0].tolist()
+            yield from state.emit(max_new_tokens)

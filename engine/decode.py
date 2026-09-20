@@ -49,11 +49,26 @@ class DecodeState:
         self.tokens = torch.zeros((batch_size, 1), dtype=torch.int64, device=model.device)
         self.position = torch.zeros(1, dtype=torch.int64, device=model.device)
         self.key_positions = torch.arange(capacity, device=model.device)
+        # Cos/sin for every slot, from the model's own rotary module: one product,
+        # cosine and cast per element, so a row equals the per-step computation.
+        self.cos, self.sin = (
+            table[0].contiguous() for table in model.model.rotary_emb(
+                torch.empty(0, dtype=model.dtype, device=model.device),
+                self.key_positions.unsqueeze(0),
+            )
+        )
         self.graph = None
         self.flash_context = None
-        if model.device.type == "cuda":
+        self.fused_forward = None
+        cuda = model.device.type == "cuda"
+        if cuda:
             from flash_decode import make_flash_context
             self.flash_context = make_flash_context(model, batch_size, max_new_tokens, self.key_positions)
+            if self.flash_context is not None:
+                from decode_step import fused_decode_forward
+                self.fused_forward = fused_decode_forward
+        self.host = torch.empty((batch_size, 1), dtype=torch.int64, pin_memory=cuda)
+        self.ready = torch.cuda.Event() if cuda else None
 
     def prefill(self, input_ids):
         prompt_length = input_ids.shape[1]
@@ -71,11 +86,35 @@ class DecodeState:
     def step(self):
         mask = ((self.key_positions <= self.position).view(1, 1, 1, -1)
                 if self.flash_context is None else self.flash_context.prepare(self.position))
-        logits = qwen_forward(self.model, self.tokens, self.cache, self.position, mask,
-                              flash_context=self.flash_context)
+        if self.fused_forward is None:
+            logits = qwen_forward(self.model, self.tokens, self.cache, self.position, mask,
+                                  flash_context=self.flash_context)
+        else:
+            logits = self.fused_forward(self.model, self.cache, self.tokens, self.position,
+                                        mask, self.flash_context, self.cos, self.sin)
         self.tokens.copy_(logits[:, -1, :].argmax(dim=-1, keepdim=True))
         self.position.add_(1)
         return logits
+
+    def emit(self, max_new_tokens):
+        """Yield one host list per output step after prefill.
+
+        The device-to-host copy of step k is enqueued before step k+1 is
+        launched, intended to let the pipe write and Python resume overlap
+        GPU work. Exactly max_new_tokens - 1 steps run.
+        """
+        for step in range(max_new_tokens):
+            self.host.copy_(self.tokens, non_blocking=True)
+            if self.ready is not None:
+                self.ready.record()
+            if step + 1 < max_new_tokens:
+                if self.graph is None:
+                    self.step()
+                else:
+                    self.graph.replay()
+            if self.ready is not None:
+                self.ready.synchronize()
+            yield self.host[:, 0].tolist()
 
     def capture(self):
         tokens = self.tokens.clone()

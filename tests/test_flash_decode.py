@@ -198,7 +198,8 @@ class FlashCPU(unittest.TestCase):
         context = flash.FlashDecodeContext(2, 4, 2, torch.arange(13))
         state = SimpleNamespace(flash_context=context, position=torch.tensor([7]),
                                 key_positions=torch.arange(13), tokens=torch.zeros(2, 1, dtype=torch.long),
-                                model=object(), cache=object())
+                                model=object(), cache=object(), fused_forward=None,
+                                cos=object(), sin=object())
         def forward(model, tokens, cache, position, mask, flash_context):
             self.assertIs(flash_context, context)
             self.assertTrue(bool((context.used == 8).all()))
@@ -209,6 +210,18 @@ class FlashCPU(unittest.TestCase):
         env["step"](state)
         torch.testing.assert_close(state.tokens, torch.tensor([[1], [0]]))
         self.assertEqual(int(state.position), 8)
+        # With a fused forward installed, step routes there with the same prepared prefix.
+        def fused(model, cache, tokens, position, mask, flash_context, cos, sin):
+            self.assertIs(flash_context, context)
+            self.assertIs(mask, context.mask)
+            self.assertTrue(bool((context.used == 9).all()))
+            self.assertIs(cos, state.cos); self.assertIs(sin, state.sin)
+            return torch.tensor([[[9., 3., 1.]], [[5., 0., 7.]]])
+        state.fused_forward = fused
+        env = functions_from(ENGINE / "decode.py", {"step"}, {"torch": torch, "qwen_forward": mock.Mock(side_effect=AssertionError("module path must not run"))})
+        env["step"](state)
+        torch.testing.assert_close(state.tokens, torch.tensor([[0], [2]]))
+        self.assertEqual(int(state.position), 9)
 
     @torch.inference_mode()
     def test_attention_dispatch_context_and_unchanged_fallback(self):
