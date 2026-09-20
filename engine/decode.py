@@ -128,11 +128,6 @@ class DecodeState:
             yield self.host[:, 0].tolist()
 
     def capture(self):
-        # Shape is known in warmup. Avoid allocating duplicate weights for
-        # prefill-only requests or shapes that use the native projection path.
-        if self.fused_forward is not None and 1 <= self.shape[0] <= 64:
-            from weight_layout import ensure_tiled_weights
-            ensure_tiled_weights(self.model)
         tokens = self.tokens.clone()
         position = self.position.clone()
         current_stream = torch.cuda.current_stream()
