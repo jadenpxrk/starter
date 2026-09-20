@@ -21,8 +21,10 @@ if HAS_TRITON:
     import qk_norm_rope as adapter
 else:
     # Only the CPU orchestration is exercised without Triton; kernels are replaced below.
-    with mock.patch.dict(sys.modules, {name: mock.Mock() for name in
-                                       ("kernels.qk_norm_rope", "kernels.decode_fused")}):
+    with mock.patch.dict(sys.modules, {
+            "kernels.qk_norm_rope": mock.Mock(), "kernels.decode_fused": mock.Mock(),
+            # The static shape rule keeps F.linear here, exactly as on a CPU device.
+            "kernels.skinny_gemm": mock.Mock(supports=mock.Mock(return_value=False))}):
         import decode_step
         import qk_norm_rope as adapter
 import decode

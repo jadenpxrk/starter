@@ -7,7 +7,7 @@ CPU/unsupported configurations retain the original qwen_forward path.
 """
 
 import torch
-from blas_backend import cublaslt_linear
+from torch.nn import functional as F
 
 
 def _native_attention(q, keys, values, length, scale):
@@ -37,19 +37,19 @@ def prefill_forward(model, cache, inputs, cos, sin):
         attn = layer.self_attn
         keys, values = cache.key_cache[index], cache.value_cache[index]
         q = prefill_qkv(
-            cublaslt_linear(normed, attn.qkv_weight), attn.q_norm.weight, attn.k_norm.weight,
+            F.linear(normed, attn.qkv_weight), attn.q_norm.weight, attn.k_norm.weight,
             attn.q_norm.variance_epsilon, attn.k_norm.variance_epsilon,
             cos, sin, keys, values, length,
         )
         attended = _native_attention(q, keys, values, length, attn.scaling)
         del q
-        projected = cublaslt_linear(attended.reshape(batch * length, -1), attn.o_proj.weight)
+        projected = F.linear(attended.reshape(batch * length, -1), attn.o_proj.weight)
         del attended
         post = layer.post_attention_layernorm
         x, normed = add_rms_norm(x, projected, post.weight, post.variance_epsilon)
         del projected
-        hidden = silu_mul(cublaslt_linear(normed, layer.mlp.gate_up_weight))
-        branch = cublaslt_linear(hidden, layer.mlp.down_proj.weight)
+        hidden = silu_mul(F.linear(normed, layer.mlp.gate_up_weight))
+        branch = F.linear(hidden, layer.mlp.down_proj.weight)
         del hidden
         last = index + 1 == len(layers)
         following = base.norm if last else layers[index + 1].input_layernorm
@@ -59,7 +59,7 @@ def prefill_forward(model, cache, inputs, cos, sin):
             branch = branch.view(batch, length, -1)[:, -1, :].contiguous()
         x, normed = add_rms_norm(x, branch, following.weight, following.variance_epsilon)
         del branch
-    return cublaslt_linear(normed, model.lm_head.weight).unsqueeze(1)
+    return F.linear(normed, model.lm_head.weight).unsqueeze(1)
 
 
 class PrefillPlan:
