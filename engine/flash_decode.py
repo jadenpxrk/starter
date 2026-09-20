@@ -3,7 +3,8 @@
 A (sequence, KV-head) pair is a virtual batch element. This makes the existing
 head-major cache a flat varlen input by VIEW, with no KV relayout or copies.
 Only DecodeState's uniform, initialized prefix mask may use this interface.
-There is no timing selector, custom floating-point kernel, or telemetry.
+There is no timing selector or telemetry. Small-query CUDA GQA uses the
+full-context Triton plan below; larger groups retain the native operator.
 """
 
 import torch
@@ -43,6 +44,12 @@ class FlashDecodeContext:
         self.used = torch.zeros(virtual_batch, dtype=torch.int32,
                                 device=key_positions.device)
         self.mask = None
+        self.small_query = None
+        if key_positions.is_cuda and self.groups <= 16:
+            from kernels.small_query_attention import SmallQueryAttention
+            self.small_query = SmallQueryAttention(
+                batch, query_heads, kv_heads, capacity, key_positions.device,
+            )
 
     def prepare(self, position):
         """Called once per step, before cache update/attention in all layers.
@@ -71,6 +78,8 @@ class FlashDecodeContext:
     def attention(self, query, key, value, mask, scale):
         if torch.is_grad_enabled() or not query.is_cuda or not self.matches(query, key, value, mask):
             raise ValueError("Flash decode requires its prepared prefix and contiguous BF16 CUDA Q/K/V")
+        if self.small_query is not None:
+            return self.small_query.run(query, key, value, self.used, scale)
         return self._views_and_call(query, key, value, scale)
 
     def _views_and_call(self, query, key, value, scale):

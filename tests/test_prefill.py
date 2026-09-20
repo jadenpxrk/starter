@@ -29,24 +29,6 @@ prefill = load("prefill_under_test", ENGINE / "prefill.py")
 mlp = load("prefill_test_mlp", ENGINE / "mlp.py")
 
 
-class FakeLaunch:
-    """Stands in for triton.jit: records each launch's grid and keyword arguments."""
-    calls = []
-    def __init__(self, fn):
-        self.fn = fn
-    def __getitem__(self, grid):
-        return lambda *args, **kwargs: FakeLaunch.calls.append((grid, args, kwargs))
-
-
-def load_kernel_module():
-    fake_triton = mock.Mock(jit=FakeLaunch, cdiv=lambda a, b: -(-a // b))
-    with mock.patch.dict(sys.modules, {"triton": fake_triton, "triton.language": mock.Mock()}):
-        return load("prefill_kernels_under_test", ENGINE / "kernels/prefill.py")
-
-
-HEADS = load_kernel_module().HEADS
-
-
 def norm(x, weight, eps):
     f = x.float()
     return (f * torch.rsqrt(f.square().sum(-1, keepdim=True) / f.shape[-1] + eps)).to(x.dtype) * weight
@@ -115,28 +97,15 @@ class Ops:
     def where(test, a, b):
         return torch.where(torch.as_tensor(test), torch.as_tensor(a), torch.as_tensor(b))
     @staticmethod
-    def indices(p, mask=None):
+    def indices(p):
         i = torch.as_tensor(p.offsets, dtype=torch.int64)
-        if mask is not None:
-            mask = torch.as_tensor(mask)
-            i, mask = torch.broadcast_tensors(i, mask)
-            # Masked lanes may hold any offset, including negative K/V slots of Q rows.
-            i = torch.where(mask, i, torch.zeros_like(i))
         if bool(((i < 0) | (i >= p.data.numel())).any()):
             raise AssertionError("out-of-bounds pointer access")
-        return i, mask
-    def load(self, p, mask=None, other=0.0):
-        i, mask = self.indices(p, mask)
-        values = p.data[i]
-        if mask is not None:
-            values = torch.where(mask, values, torch.full_like(values, other))
-        return values
-    def store(self, p, value, mask=None):
-        i, mask = self.indices(p, mask)
-        value = torch.as_tensor(value)
-        if mask is not None:
-            value, _ = torch.broadcast_tensors(value, mask)
-            i, value = i[mask], value[mask]
+        return i
+    def load(self, p):
+        return p.data[self.indices(p)]
+    def store(self, p, value):
+        i = self.indices(p)
         p.data[i] = value.to(p.data.dtype)
         p.writes.scatter_add_(0, i.flatten(), torch.ones_like(i.flatten()))
 
@@ -165,10 +134,9 @@ class KernelBody:
         q = torch.empty(b, length, nq, d, dtype=p.dtype)
         qp, kp, vp = Pointer(q), Pointer(keys), Pointer(values)
         args = [Pointer(t) for t in (p, qw, kw, cos, sin)]
-        groups = -(-(nq + nk) // HEADS)
-        for program in range(b * length * groups):
+        for program in range(b * length * (nq + nk)):
             self.ops.program = program
-            self.kernel(*args, qp, kp, vp, length, c, nq, nk, d, qe, ke, HEADS, groups)
+            self.kernel(*args, qp, kp, vp, length, c, nq, nk, d, qe, ke)
         expected = torch.zeros_like(keys, dtype=torch.int64)
         expected[:, :, :length] = 1
         assert torch.equal(kp.writes.view_as(expected), expected)
@@ -251,11 +219,7 @@ class PrefillCPU(unittest.TestCase):
     def test_kernel_body_values_indexing_and_all_prefix_writes(self):
         torch.manual_seed(41)
         body = KernelBody()
-        # Head groups: (4,2) dead lanes in one group; (32,8) exactly five full groups;
-        # (6,2) one full group; (12,4) a second group mixing Q rows 8-11 and K rows 12-15.
-        cases = ((1,1,3,4,2), (2,7,13,4,2), (1,33,39,32,8), (3,3,11,6,2), (1,129,137,4,2),
-                 (2,5,9,12,4))
-        self.assertEqual(HEADS & (HEADS - 1), 0)
+        cases = ((1,1,3,4,2), (2,7,13,4,2), (1,33,39,32,8), (3,3,11,6,2), (1,129,137,4,2))
         for b,t,c,nq,nk in cases:
             with self.subTest(shape=(b,t,c,nq,nk)):
                 p = torch.randn(b*t, (nq+2*nk)*128).bfloat16()
@@ -283,36 +247,6 @@ class PrefillCPU(unittest.TestCase):
         correct=KernelBody().run(p,qw,kw,1e-6,1e-6,cos,sin,k,v,t)
         wrong=KernelBody(True).run(p,qw,kw,1e-6,1e-6,cos,sin,k.clone(),v.clone(),t)
         self.assertGreater(int(torch.count_nonzero(correct!=wrong)),0)
-
-    def test_wrapper_launches_one_program_per_token_head_group(self):
-        # Synthetic CUDA metadata through the real wrapper; the launch itself is recorded, not run.
-        kernels = load_kernel_module()
-        def tensor(shape):
-            return SimpleNamespace(ndim=len(shape), shape=shape, is_cuda=True, device=torch.device('cuda'),
-                                   dtype=torch.bfloat16, is_contiguous=lambda: True)
-        marker = object()
-        for b, t, c, nq, nk, groups in ((4, 2048, 2080, 32, 8, 5), (1, 3, 8, 4, 2, 1), (2, 5, 9, 12, 4, 2)):
-            with self.subTest(nq=nq, nk=nk):
-                FakeLaunch.calls.clear()
-                qkv = tensor((b * t, (nq + 2 * nk) * 128))
-                keys, values = tensor((b, nk, c, 128)), tensor((b, nk, c, 128))
-                with mock.patch.object(torch, 'empty', return_value=marker) as empty:
-                    out = kernels.prefill_qkv(qkv, tensor((128,)), tensor((128,)), 1e-6, 3e-6,
-                                              tensor((c, 128)), tensor((c, 128)), keys, values, t)
-                self.assertIs(out, marker)
-                empty.assert_called_once_with((b, t, nq, 128), device=qkv.device, dtype=torch.bfloat16)
-                (grid, args, kwargs), = FakeLaunch.calls
-                self.assertEqual(grid, (b * t * groups,))
-                self.assertEqual(kwargs['HEADS'] * kwargs['GROUPS'] >= nq + nk, True)
-                self.assertEqual((kwargs['HEADS'], kwargs['GROUPS']), (HEADS, groups))
-                self.assertEqual((kwargs['T'], kwargs['C'], kwargs['NQ'], kwargs['NK'], kwargs['D']),
-                                 (t, c, nq, nk, 128))
-                self.assertEqual((kwargs['QEPS'], kwargs['KEPS']), (1e-6, 3e-6))
-                self.assertIs(args[5], marker)
-                self.assertIs(args[6], keys); self.assertIs(args[7], values)
-        with self.assertRaises(ValueError):
-            kernels.prefill_qkv(tensor((6, 6144)), tensor((128,)), tensor((128,)), 1e-6, 1e-6,
-                                tensor((8, 128)), tensor((8, 128)), tensor((1, 8, 8, 128)), tensor((1, 8, 8, 128)), 3)
 
     @torch.inference_mode()
     def test_factory_supported_metadata_and_fallback_guards(self):
