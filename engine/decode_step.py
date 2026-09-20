@@ -8,19 +8,22 @@ the CUDA/BF16 static-cache configuration that owns a Flash decode context.
 
 Decode-sized projections (at most kernels.skinny_gemm.MAX_ROWS rows) run as
 split-K Triton weight streams whose FP32 partials the fused consumers add and
-round; gate/up carries SiLU * up in its epilogue, and the packed Q/K/V
-projection carries head norm, RoPE and the cache write in its epilogue, one
-program per complete head. Larger row counts and tile-misaligned shapes keep
-F.linear. The rule is static per shape.
+round. Gate/up uses the paired split-K experiment in split_swiglu for long
+reductions, otherwise the original fused SiLU/product kernel. Larger rows and
+tile-misaligned shapes keep F.linear. The rule is static per shape.
 """
 
 import torch
 from torch.nn import functional as F
 
 from kernels.decode_fused import add_rms_norm, qkv_norm_rope_cache, silu_mul
-from kernels.skinny_gemm import (
-    linear_partials, linear_qkv_norm_rope_cache, linear_silu_mul, supports, supports_qkv,
-)
+from kernels.skinny_gemm import linear_partials, supports
+
+
+def linear_silu_mul(x, weight):
+    # Import only on the CUDA skinny path; CPU/native fallbacks need no Triton.
+    from kernels.split_swiglu import linear_silu_mul as split_silu_mul
+    return split_silu_mul(x, weight)
 
 
 def _project(x, weight):
@@ -44,15 +47,11 @@ def fused_decode_forward(model, cache, tokens, position, mask, context, cos, sin
     for index, layer in enumerate(layers):
         attn = layer.self_attn
         keys, values = cache.key_cache[index], cache.value_cache[index]
-        norm_args = (
-            attn.q_norm.weight, attn.k_norm.weight,
+        q = qkv_norm_rope_cache(
+            _project(normed, attn.qkv_weight), attn.q_norm.weight, attn.k_norm.weight,
             attn.q_norm.variance_epsilon, attn.k_norm.variance_epsilon,
             cos, sin, position, keys, values,
         )
-        if supports_qkv(normed, attn.qkv_weight, keys):
-            q = linear_qkv_norm_rope_cache(normed, attn.qkv_weight, *norm_args)
-        else:
-            q = qkv_norm_rope_cache(_project(normed, attn.qkv_weight), *norm_args)
         attended = context.attention(q, keys, values, mask, attn.scaling)
         post = layer.post_attention_layernorm
         x, normed = add_rms_norm(
