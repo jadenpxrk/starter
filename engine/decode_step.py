@@ -1,10 +1,12 @@
 """One captured Qwen3 decode step that walks the loaded layers directly.
 
 Same formula as Qwen3DecoderLayer in Transformers 4.51.3 with decode-only
-fusions: packed Q/K/V projection, head norm + RoPE + cache write in one
-launch, residual add folded into the following RMSNorm, SiLU * up in one
-launch. Prefill keeps the module path; DecodeState.step chooses this only on
-the CUDA/BF16 static-cache configuration that owns a Flash decode context.
+fusions: packed Q/K/V projection, head norm + RoPE + cache write + attention
+in one launch when the context owns a small-query plan (otherwise the
+separate consumer and attention launches), residual add folded into the
+following RMSNorm, SiLU * up in one launch. Prefill keeps the module path;
+DecodeState.step chooses this only on the CUDA/BF16 static-cache
+configuration that owns a Flash decode context.
 
 Decode-sized projections (at most kernels.skinny_gemm.MAX_ROWS rows) run as
 split-K Triton weight streams whose FP32 partials the fused consumers add and
@@ -37,15 +39,25 @@ def fused_decode_forward(model, cache, tokens, position, mask, context, cos, sin
     batch = tokens.shape[0]
     x = base.embed_tokens(tokens).view(batch, -1)
     normed = layers[0].input_layernorm(x)
+    # Static per context: the plan exists or not for the whole generation.
+    one_launch = getattr(context, "small_query", None) is not None
     for index, layer in enumerate(layers):
         attn = layer.self_attn
         keys, values = cache.key_cache[index], cache.value_cache[index]
-        q = qkv_norm_rope_cache(
-            _project(normed, attn.qkv_weight), attn.q_norm.weight, attn.k_norm.weight,
-            attn.q_norm.variance_epsilon, attn.k_norm.variance_epsilon,
-            cos, sin, position, keys, values,
-        )
-        attended = context.attention(q, keys, values, mask, attn.scaling)
+        projected = _project(normed, attn.qkv_weight)
+        if one_launch:
+            attended = context.attention_from_qkv(
+                projected, attn.q_norm.weight, attn.k_norm.weight,
+                attn.q_norm.variance_epsilon, attn.k_norm.variance_epsilon,
+                cos, sin, position, keys, values, attn.scaling,
+            )
+        else:
+            q = qkv_norm_rope_cache(
+                projected, attn.q_norm.weight, attn.k_norm.weight,
+                attn.q_norm.variance_epsilon, attn.k_norm.variance_epsilon,
+                cos, sin, position, keys, values,
+            )
+            attended = context.attention(q, keys, values, mask, attn.scaling)
         post = layer.post_attention_layernorm
         x, normed = add_rms_norm(
             x, _project(attended.view(batch, -1), attn.o_proj.weight),

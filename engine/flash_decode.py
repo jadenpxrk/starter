@@ -82,6 +82,16 @@ class FlashDecodeContext:
             return self.small_query.run(query, key, value, self.used, scale)
         return self._views_and_call(query, key, value, scale)
 
+    def attention_from_qkv(self, qkv, q_weight, k_weight, q_eps, k_eps, cos, sin, position,
+                           key, value, scale):
+        """One launch on the small-query plan: complete packed Q/K/V, write the
+        K/V slot at ``position`` and attend over [0, position]. Callers dispatch
+        statically on ``self.small_query``; there is no fallback here."""
+        if self.small_query is None or torch.is_grad_enabled():
+            raise ValueError("fused Q/K/V attention requires this context's small-query plan")
+        return self.small_query.run_fused(qkv, q_weight, k_weight, q_eps, k_eps, cos, sin,
+                                          position, key, value, scale)
+
     def _views_and_call(self, query, key, value, scale):
         # virtual index = batch_index * Hkv + kv_head; query heads for it are
         # kv_head*G ... kv_head*G+G-1. No query ever sees another KV head/batch.

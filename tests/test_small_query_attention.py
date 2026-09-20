@@ -349,6 +349,7 @@ class SmallQueryCPU(unittest.TestCase):
             float32=torch.float32, bfloat16=torch.bfloat16, int32=torch.int32,
             cuda=SimpleNamespace(get_device_properties=lambda d: SimpleNamespace(multi_processor_count=132)),
             empty=lambda shape, dtype, device: torch.empty(shape, dtype=dtype),
+            zeros=lambda shape, dtype, device: torch.zeros(shape, dtype=dtype),
         )
         tree = ast.parse(KERNEL.read_text())
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SmallQueryAttention")
