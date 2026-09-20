@@ -131,54 +131,12 @@ def fake(shape, dtype=torch.bfloat16, cuda=True, contiguous=True):
                            is_contiguous=lambda: contiguous)
 
 
-class SyncOps(Ops):
-    """Adds the arrival handshake: programs run one at a time, in any order."""
-
-    def load(self, p, mask=None, other=0.0, cache_modifier=""):
-        assert cache_modifier in ("", ".cg")
-        return super().load(p, mask, other)
-
-    def atomic_add(self, p, value, sem=None):
-        assert sem == "acq_rel", "arrival counting must publish and observe"
-        i, _ = self._indices(p, None)
-        old = p.data[i].clone()
-        p.data[i] = old + value
-        return old
-
-    @staticmethod
-    def debug_barrier():
-        pass
-
-
 class CpuKernelBodies:
     def __init__(self):
-        self.ops = SyncOps()
+        self.ops = Ops()
         env = source_functions(KERNELS / "skinny_gemm.py",
-                               {"_partials_kernel", "_silu_mul_kernel", "_add_norm_kernel"},
-                               {"tl": self.ops})
+                               {"_partials_kernel", "_silu_mul_kernel"}, {"tl": self.ops})
         self.partials, self.silu = env["_partials_kernel"], env["_silu_mul_kernel"]
-        self.add_norm = env["_add_norm_kernel"]
-
-    def run_add_norm(self, x, w, residual, gain, eps, splits, bm, order):
-        m, k = x.shape
-        n = w.shape[0]
-        blocks = n // BN
-        partials = torch.full((splits, m, n), float("nan"))
-        sumsq = torch.full((blocks, bm), float("nan"))
-        counters = torch.zeros(blocks + 1, dtype=torch.int32)
-        total, normed = (torch.full((m, n), float("nan")).bfloat16() for _ in range(2))
-        pointers = [Pointer(t) for t in (x, w, residual, gain, partials, sumsq, counters, total, normed)]
-        assert sorted(order) == sorted((c, s) for c in range(blocks) for s in range(splits))
-        for column, split in order:
-            self.ops.program = (column, split)
-            self.add_norm(*pointers, m, n, k, k // splits, eps, bm, BN, BK, splits, blocks,
-                          max(32, 4096 // bm))
-        for p in pointers[:4]:
-            assert bool((p.writes == 0).all()), "inputs are read-only"
-        assert bool((pointers[4].writes == 1).all()), "every partial written exactly once"
-        assert bool((pointers[7].writes == 1).all()) and bool((pointers[8].writes == 1).all())
-        assert bool((counters == 0).all()), "counters must be left zeroed for the next launch"
-        return total, normed
 
     def run_partials(self, x, w, splits, bm):
         m, k = x.shape
@@ -208,10 +166,6 @@ class CpuKernelBodies:
 def reference_silu_mul(x, w):
     gate, up = F.linear(x.float(), w.float()).to(torch.bfloat16).chunk(2, dim=-1)
     return (F.silu(gate.float()).to(torch.bfloat16).float() * up.float()).to(torch.bfloat16)
-
-
-def triton_next_pow2(n):
-    return 1 << (n - 1).bit_length()
 
 
 def sum_partials_bf16(partials):
@@ -293,64 +247,6 @@ class SkinnyCPU(unittest.TestCase):
         gate, up = F.linear(x.float(), w.float()).chunk(2, dim=-1)
         unrounded = (F.silu(gate) * up).to(torch.bfloat16)
         self.assertFalse(torch.equal(unrounded, reference_silu_mul(x, w)))
-
-    def test_kernel_body_add_norm_is_order_independent_and_matches_consumer(self):
-        """The fused epilogue equals the separate consumer, whichever program arrives last."""
-        torch.manual_seed(10)
-        bodies = CpuKernelBodies()
-        ops = Ops()
-        env = source_functions(KERNELS / "decode_fused.py", {"_add_rms_norm_kernel"}, {"tl": ops})
-        consumer = env["_add_rms_norm_kernel"]
-        import random
-        for m, n, k, splits, bm in ((1, 64, 128, 2, 16), (3, 96, 256, 4, 16), (16, 64, 64, 1, 16),
-                                    (17, 64, 128, 2, 32), (5, 160, 192, 1, 16)):
-            with self.subTest(m=m, n=n, k=k, splits=splits):
-                x = torch.randn(m, k).bfloat16()
-                w = torch.randn(n, k).bfloat16() / k ** 0.5
-                residual = torch.randn(m, n).bfloat16()
-                gain = torch.randn(n).bfloat16()
-                programs = [(c, s) for c in range(n // BN) for s in range(splits)]
-                orders = [list(programs), list(reversed(programs))]
-                shuffled = list(programs)
-                random.Random(m * n + k).shuffle(shuffled)
-                orders.append(shuffled)
-                results = [bodies.run_add_norm(x, w, residual, gain, 1e-6, splits, bm, o) for o in orders]
-                for total, normed in results[1:]:
-                    torch.testing.assert_close(total, results[0][0], rtol=0, atol=0)
-                    torch.testing.assert_close(normed, results[0][1], rtol=0, atol=0)
-                total, normed = results[0]
-                self.assertTrue(bool(torch.isfinite(normed).all()))
-                partials = bodies.run_partials(x, w, splits, bm)
-                ref_total, ref_normed = torch.empty_like(residual), torch.empty_like(residual)
-                pointers = [Pointer(t) for t in (residual, partials, gain, ref_total, ref_normed)]
-                for row in range(m):
-                    ops.program = (row, 0)
-                    consumer(*pointers, n, 1e-6, m * n, triton_next_pow2(n), splits)
-                torch.testing.assert_close(total, ref_total, rtol=0, atol=0)
-                # Sum-of-squares grouping differs (per column block, then blocks): one BF16 ulp.
-                torch.testing.assert_close(normed, ref_normed, rtol=8e-3, atol=0)
-                self.assertGreater(int((normed == ref_normed).sum()), normed.numel() * 9 // 10)
-                expected_total = (residual.float() + sum_partials_bf16(partials).float()).to(torch.bfloat16)
-                torch.testing.assert_close(total, expected_total, rtol=0, atol=0)
-
-    def test_add_norm_wrapper_validates_before_launch(self):
-        x, w = fake((4, 4096)), fake((2560, 4096))
-        for residual, gain in (
-            (fake((4, 2561)), fake((2560,))),
-            (fake((5, 2560)), fake((2560,))),
-            (fake((4, 2560), dtype=torch.float32), fake((2560,))),
-            (fake((4, 2560), contiguous=False), fake((2560,))),
-            (fake((4, 2560), cuda=False), fake((2560,))),
-            (fake((4, 2560)), fake((2561,))),
-            (fake((4, 2560)), fake((2560,), dtype=torch.float32)),
-        ):
-            with self.assertRaises(ValueError):
-                skinny.linear_add_rms_norm(x, w, residual, gain, 1e-6)
-        with self.assertRaises(ValueError):
-            skinny.linear_add_rms_norm(fake((65, 4096)), w, fake((65, 2560)), fake((2560,)), 1e-6)
-        # o_proj and down_proj share one counter buffer: both are 80 column blocks wide.
-        self.assertEqual(2560 // BN, 4096 // BN - 48)
-        self.assertEqual(skinny.split_count(2560, 4096) * 80, 640)
 
     def test_consumer_kernels_add_partials_then_round_once(self):
         """Run the modified consumer bodies with SPLITS=0 and SPLITS=S on CPU."""
@@ -510,7 +406,7 @@ class SkinnyCPU(unittest.TestCase):
             values.index_copy_(2, position, v.reshape(batch, kv_heads, 1, width))
             return q.contiguous()
 
-        calls = {"partials": 0, "silu": 0, "supports": 0, "add_norm": 0}
+        calls = {"partials": 0, "silu": 0, "supports": 0}
 
         def supports(x, weight, pairs=False):
             calls["supports"] += 1
@@ -524,18 +420,13 @@ class SkinnyCPU(unittest.TestCase):
             calls["partials"] += 1
             return partials(x, weight)
 
-        def linear_add_rms_norm(x, weight, residual, gain, eps):
-            calls["add_norm"] += 1
-            return add_rms_norm(residual, partials(x, weight), gain, eps)
-
         patches = (
             mock.patch.object(decode_step, "supports", side_effect=supports),
             mock.patch.object(decode_step, "linear_partials", side_effect=linear_partials),
             mock.patch.object(decode_step, "linear_silu_mul", side_effect=linear_silu_mul),
-            mock.patch.object(decode_step, "linear_add_rms_norm", side_effect=linear_add_rms_norm),
+            mock.patch.object(decode_step, "add_rms_norm", side_effect=add_rms_norm),
             mock.patch.object(decode_step, "qkv_norm_rope_cache", side_effect=qkv_norm_rope_cache),
             mock.patch.object(decode_step, "silu_mul", side_effect=AssertionError("unfused MLP path")),
-            mock.patch.object(decode_step, "add_rms_norm", side_effect=AssertionError("unfused norm path")),
         )
         for batch, length, count in ((1, 3, 3), (3, 7, 4)):
             with self.subTest(batch=batch, length=length):
@@ -552,11 +443,10 @@ class SkinnyCPU(unittest.TestCase):
                     current, cache = state.tokens.clone(), expected.past_key_values
                     if step + 1 < count:
                         before = dict(calls)
-                        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
                             logits = state.step()
                         layers = config.num_hidden_layers
-                        self.assertEqual(calls["partials"] - before["partials"], layers)
-                        self.assertEqual(calls["add_norm"] - before["add_norm"], 2 * layers)
+                        self.assertEqual(calls["partials"] - before["partials"], 3 * layers)
                         self.assertEqual(calls["silu"] - before["silu"], layers)
 
 
@@ -594,55 +484,6 @@ class SkinnyCUDA(unittest.TestCase):
         with self.assertRaises(ValueError):
             skinny.linear_partials(torch.randn(65, 256, device="cuda", dtype=torch.bfloat16),
                                    torch.randn(64, 256, device="cuda", dtype=torch.bfloat16))
-
-    @torch.inference_mode()
-    def test_add_norm_matches_separate_consumer_and_leaves_counters_zeroed(self):
-        torch.manual_seed(26)
-        for m in (1, 4, 16, 33, 64):
-            for n, k in ((2560, 4096), (2560, 9728), (1024, 256), (64, 128)):
-                with self.subTest(m=m, n=n, k=k):
-                    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-                    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / k ** 0.5
-                    residual = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
-                    gain = torch.randn(n, device="cuda", dtype=torch.bfloat16)
-                    before = tuple(t.clone() for t in (x, w, residual, gain))
-                    ref_total, ref_normed = fused.add_rms_norm(
-                        residual, skinny.linear_partials(x, w), gain, 1e-6)
-                    # Repeat: a race or a stale counter would show up as a mismatch.
-                    for _ in range(20):
-                        total, normed = skinny.linear_add_rms_norm(x, w, residual, gain, 1e-6)
-                        torch.testing.assert_close(total, ref_total, rtol=0, atol=0)
-                        torch.testing.assert_close(normed, ref_normed, rtol=8e-3, atol=0)
-                    counters = skinny._arrival_counters(x.device, n // skinny.BN)
-                    torch.cuda.synchronize()
-                    self.assertEqual(int(counters.abs().sum()), 0)
-                    for t, old in zip((x, w, residual, gain), before):
-                        torch.testing.assert_close(t, old, rtol=0, atol=0)
-                    native_total = residual + F.linear(x, w)
-                    torch.testing.assert_close(total, native_total, rtol=1.6e-2, atol=1e-2)
-
-    @torch.inference_mode()
-    def test_add_norm_graph_replay_follows_fresh_inputs(self):
-        torch.manual_seed(27)
-        x = torch.randn(4, 4096, device="cuda", dtype=torch.bfloat16)
-        w = torch.randn(2560, 4096, device="cuda", dtype=torch.bfloat16) / 64
-        residual = torch.randn(4, 2560, device="cuda", dtype=torch.bfloat16)
-        gain = torch.randn(2560, device="cuda", dtype=torch.bfloat16)
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            for _ in range(3):
-                skinny.linear_add_rms_norm(x, w, residual, gain, 1e-6)
-        torch.cuda.current_stream().wait_stream(stream)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            total, normed = skinny.linear_add_rms_norm(x, w, residual, gain, 1e-6)
-        for _ in range(5):
-            x.normal_(); residual.normal_()
-            graph.replay()
-            ref_total, ref_normed = fused.add_rms_norm(residual, skinny.linear_partials(x, w), gain, 1e-6)
-            torch.testing.assert_close(total, ref_total, rtol=0, atol=0)
-            torch.testing.assert_close(normed, ref_normed, rtol=8e-3, atol=0)
 
     @torch.inference_mode()
     def test_silu_mul_matches_unfused_path(self):
@@ -740,16 +581,11 @@ class SkinnyCUDA(unittest.TestCase):
                 logits = native(input_ids=prefix, use_cache=False).logits[:, length - 1:].float()
                 gaps = logits.amax(-1) - logits.gather(-1, tokens[..., None]).squeeze(-1)
                 self.assertLessEqual(float(gaps.max()), 2.0)
-                # Prove dispatch in eager mode: one split Q/K/V projection and two fused
-                # projection/norm launches per layer per step, none above MAX_ROWS.
+                # Prove dispatch in eager mode: 3 split projections per layer per step, none above MAX_ROWS.
                 engine.decode_state.prefill(prompt)
-                with mock.patch.object(decode_step, "linear_partials", wraps=decode_step.linear_partials) as eager, \
-                        mock.patch.object(decode_step, "linear_add_rms_norm",
-                                          wraps=decode_step.linear_add_rms_norm) as fused_norm:
+                with mock.patch.object(decode_step, "linear_partials", wraps=decode_step.linear_partials) as eager:
                     engine.decode_state.step()
-                layers = config.num_hidden_layers
-                self.assertEqual(eager.call_count, 0 if batch > skinny.MAX_ROWS else layers)
-                self.assertEqual(fused_norm.call_count, 0 if batch > skinny.MAX_ROWS else 2 * layers)
+                self.assertEqual(eager.call_count, 0 if batch > skinny.MAX_ROWS else 3 * config.num_hidden_layers)
 
 
 if __name__ == "__main__":
