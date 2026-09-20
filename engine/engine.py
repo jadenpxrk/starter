@@ -3,6 +3,7 @@
 import torch
 from transformers import AutoModelForCausalLM
 
+from blas_backend import configure_workspace
 from decode import DecodeState
 from decode_attention import install_decode_attention
 from kernels.rmsnorm import rms_norm
@@ -25,6 +26,7 @@ class Engine:
         """Load the pinned checkpoint from model_path. Untimed, budgeted."""
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
+        configure_workspace()
         self.model = (
             AutoModelForCausalLM.from_pretrained(
                 model_path,

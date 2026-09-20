@@ -16,6 +16,8 @@ from torch import nn
 from torch.nn import functional as F
 
 ENGINE = Path(__file__).resolve().parents[1] / "engine"
+# Match the source-only archive's import path when this test runs by itself.
+sys.path.insert(0, str(ENGINE))
 
 
 def load(name, path):
