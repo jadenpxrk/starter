@@ -76,6 +76,11 @@ class DecodeState:
                 model, self.cache, batch_size, prompt_length, self.cos, self.sin,
             )
 
+        self.lookup_plan = None
+        if self.prefill_plan is not None and self.flash_context is not None:
+            from speculative import make_lookup_plan
+            self.lookup_plan = make_lookup_plan(self)
+
     def prefill(self, input_ids):
         prompt_length = input_ids.shape[1]
         # Overwrite every prompt slot; prefill attends only to the new K/V.
@@ -146,3 +151,5 @@ class DecodeState:
             self.step()
         self.tokens.copy_(tokens)
         self.position.copy_(position)
+        if getattr(self, "lookup_plan", None) is not None:
+            self.lookup_plan.capture()

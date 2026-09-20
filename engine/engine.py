@@ -66,4 +66,7 @@ class Engine:
             state.prefill(prompt)
             if max_new_tokens > 1 and state.graph is None:
                 state.capture()
-            yield from state.emit(max_new_tokens)
+            if state.lookup_plan is None:
+                yield from state.emit(max_new_tokens)
+            else:
+                yield from state.lookup_plan.emit(input_ids, max_new_tokens)
