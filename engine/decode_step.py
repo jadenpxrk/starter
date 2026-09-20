@@ -30,8 +30,8 @@ def _mlp_hidden(normed, gate_up_weight):
     return silu_mul(F.linear(normed, gate_up_weight))
 
 
-def fused_decode_forward(model, cache, tokens, position, mask, context, cos, sin):
-    """Logits [batch, 1, vocab] for one token per sequence at ``position``."""
+def fused_decode_forward(model, cache, tokens, position, mask, context, cos, sin, *, return_tokens=False):
+    """Logits [B,1,V], or int64 IDs[B,1] when return_tokens=True. Same layer/cache path."""
     base = model.model
     layers = base.layers
     batch = tokens.shape[0]
@@ -57,4 +57,7 @@ def fused_decode_forward(model, cache, tokens, position, mask, context, cos, sin
             x, _project(hidden, layer.mlp.down_proj.weight),
             following.weight, following.variance_epsilon,
         )
+    if return_tokens:
+        from greedy_head import greedy_head
+        return greedy_head(normed, model.lm_head.weight)
     return F.linear(normed, model.lm_head.weight).unsqueeze(1)

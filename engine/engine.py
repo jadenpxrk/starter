@@ -63,7 +63,7 @@ class Engine:
                 self.decode_state = None
                 self.decode_state = DecodeState(self.model, *shape)
             state = self.decode_state
-            state.prefill(prompt)
+            state.prefill(prompt, return_tokens=True)
             if max_new_tokens > 1 and state.graph is None:
                 state.capture()
             yield from state.emit(max_new_tokens)

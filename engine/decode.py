@@ -76,7 +76,7 @@ class DecodeState:
                 model, self.cache, batch_size, prompt_length, self.cos, self.sin,
             )
 
-    def prefill(self, input_ids):
+    def prefill(self, input_ids, *, return_tokens=False):
         prompt_length = input_ids.shape[1]
         # Overwrite every prompt slot; prefill attends only to the new K/V.
         # Decode masks the remaining slots, so old prompt data is never reused.
@@ -86,24 +86,36 @@ class DecodeState:
                 logits = qwen_forward(
                     self.model, input_ids, self.cache, self.key_positions[:prompt_length],
                 )
+            elif return_tokens:
+                logits = self.prefill_plan.run(input_ids, return_tokens=True)
             else:
                 logits = self.prefill_plan.run(input_ids)
         finally:
             self.cache.prefilling = False
-        self.tokens.copy_(logits[:, -1, :].argmax(dim=-1, keepdim=True))
+        if logits.dtype == self.tokens.dtype and logits.shape == self.tokens.shape:
+            self.tokens.copy_(logits)
+        else:
+            self.tokens.copy_(logits[:, -1, :].argmax(dim=-1, keepdim=True))
         self.position.fill_(prompt_length)
         return logits
 
-    def step(self):
+    def step(self, *, return_tokens=False):
         mask = ((self.key_positions <= self.position).view(1, 1, 1, -1)
                 if self.flash_context is None else self.flash_context.prepare(self.position))
         if self.fused_forward is None:
             logits = qwen_forward(self.model, self.tokens, self.cache, self.position, mask,
                                   flash_context=self.flash_context)
+        elif return_tokens:
+            logits = self.fused_forward(self.model, self.cache, self.tokens, self.position,
+                                        mask, self.flash_context, self.cos, self.sin,
+                                        return_tokens=True)
         else:
             logits = self.fused_forward(self.model, self.cache, self.tokens, self.position,
                                         mask, self.flash_context, self.cos, self.sin)
-        self.tokens.copy_(logits[:, -1, :].argmax(dim=-1, keepdim=True))
+        if logits.dtype == self.tokens.dtype and logits.shape == self.tokens.shape:
+            self.tokens.copy_(logits)
+        else:
+            self.tokens.copy_(logits[:, -1, :].argmax(dim=-1, keepdim=True))
         self.position.add_(1)
         return logits
 
@@ -137,12 +149,12 @@ class DecodeState:
             for _ in range(3):
                 self.tokens.copy_(tokens)
                 self.position.copy_(position)
-                self.step()
+                self.step(return_tokens=True)
         current_stream.wait_stream(warmup_stream)
         self.tokens.copy_(tokens)
         self.position.copy_(position)
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph, stream=warmup_stream):
-            self.step()
+            self.step(return_tokens=True)
         self.tokens.copy_(tokens)
         self.position.copy_(position)

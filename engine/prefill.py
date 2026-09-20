@@ -23,8 +23,8 @@ def _native_attention(q, keys, values, length, scale):
     )[0]
 
 
-def prefill_forward(model, cache, inputs, cos, sin):
-    """Full fresh prefill, all cache layers; return last-position logits only."""
+def prefill_forward(model, cache, inputs, cos, sin, *, return_tokens=False):
+    """Full fresh prefill; return last-position logits, or int64 IDs[B,1]."""
     from kernels.decode_fused import add_rms_norm, silu_mul
     from kernels.prefill import prefill_qkv
 
@@ -59,6 +59,9 @@ def prefill_forward(model, cache, inputs, cos, sin):
             branch = branch.view(batch, length, -1)[:, -1, :].contiguous()
         x, normed = add_rms_norm(x, branch, following.weight, following.variance_epsilon)
         del branch
+    if return_tokens:
+        from greedy_head import greedy_head
+        return greedy_head(normed, model.lm_head.weight)
     return F.linear(normed, model.lm_head.weight).unsqueeze(1)
 
 
@@ -69,34 +72,48 @@ class PrefillPlan:
         self.inputs = torch.empty((batch, length), dtype=torch.int64, device=model.device)
         self.graph = None
         self.logits = None
+        self.logit_graph = None
+        # Normal Engine use captures only the token graph. The separate logits
+        # graph remains available for diagnostics without changing output types.
+        self.token_graph = None
+        self.token_ids = None
 
-    def run(self, inputs):
+    def run(self, inputs, *, return_tokens=False):
         if (torch.is_grad_enabled() or inputs.shape != self.inputs.shape
                 or inputs.dtype != torch.int64 or inputs.device != self.inputs.device):
             raise ValueError("prefill requires fixed-shape int64 inputs under inference mode")
-        # Every call supplies new input content. No prompt-derived result is reused.
         self.inputs.copy_(inputs)
-        if self.graph is None:
+        graph = self.token_graph if return_tokens else self.logit_graph
+
+        def forward():
+            if return_tokens:
+                return prefill_forward(self.model, self.cache, self.inputs,
+                                       self.cos, self.sin, return_tokens=True)
+            return prefill_forward(self.model, self.cache, self.inputs, self.cos, self.sin)
+
+        if graph is None:
             current = torch.cuda.current_stream(self.inputs.device)
             stream = torch.cuda.Stream(device=self.inputs.device)
             stream.wait_stream(current)
             with torch.cuda.stream(stream):
                 for _ in range(2):
-                    prefill_forward(self.model, self.cache, self.inputs, self.cos, self.sin)
+                    forward()
             current.wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
-            # Private pool: never share with the separately captured decode graph.
-            # Capture records work; replay below is necessary even on this first call.
+            # Each graph owns a private pool. Engine captures only token mode;
+            # optional diagnostic-logits calls must not alias its live results.
             with torch.cuda.graph(graph, stream=stream):
-                self.logits = prefill_forward(
-                    self.model, self.cache, self.inputs, self.cos, self.sin,
-                )
+                result = forward()
             current.wait_stream(stream)
-            self.graph = graph
-        self.graph.replay()
-        # Graph-owned storage, valid until the next prefill. The caller consumes
-        # logits to choose token 0 before decode begins; it must not mutate them.
-        return self.logits
+            if return_tokens:
+                self.token_graph, self.token_ids = graph, result
+            else:
+                self.logit_graph, self.logits = graph, result
+        self.graph = graph  # Most recently used graph; diagnostic compatibility.
+        graph.replay()
+        # Graph-owned storage until the next run of that mode. Caller copies
+        # IDs or consumes logits before decode; it must not mutate the result.
+        return self.token_ids if return_tokens else self.logits
 
 
 def make_prefill_plan(model, cache, batch, length, cos, sin):
