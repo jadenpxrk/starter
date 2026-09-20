@@ -4,6 +4,7 @@ import torch
 from transformers import AutoModelForCausalLM
 
 from decode import DecodeState
+from compact_decode import install_compact_decode
 from decode_attention import install_decode_attention
 from kernels.rmsnorm import rms_norm
 from mlp import PackedMLP
@@ -45,6 +46,7 @@ class Engine:
             layer.self_attn.k_norm = FusedRMSNorm(layer.self_attn.k_norm)
             layer.mlp = PackedMLP(layer.mlp)
             layer.self_attn = DecodeQKNormRoPE(layer.self_attn)
+        install_compact_decode(self.model)
         self.decode_state = None
 
     def generate(self, input_ids: list[list[int]], max_new_tokens: int):
@@ -66,4 +68,7 @@ class Engine:
             state.prefill(prompt)
             if max_new_tokens > 1 and state.graph is None:
                 state.capture()
-            yield from state.emit(max_new_tokens)
+            yield state.tokens[:, 0].tolist()
+            for _ in range(max_new_tokens - 1):
+                state.graph.replay()
+                yield state.tokens[:, 0].tolist()

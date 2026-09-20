@@ -82,11 +82,10 @@ class AdapterFallbackTests(unittest.TestCase):
 class QKCUDA(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        global qk_norm_rope, rms_norm, Engine, FusedRMSNorm, decode_step
+        global qk_norm_rope, rms_norm, Engine, FusedRMSNorm
         from kernels.qk_norm_rope import qk_norm_rope
         from kernels.rmsnorm import rms_norm
         from engine import Engine, FusedRMSNorm
-        import decode_step
 
     @torch.inference_mode()
     def test_kernel_values_strides_positions_and_rounding(self):
@@ -190,9 +189,7 @@ class QKCUDA(unittest.TestCase):
                     current = state.tokens.clone()
                     cache = ref.past_key_values
                     if step + 1 < count:
-                        # Decode runs the fused step: packed Q/K/V per layer, no module path.
-                        with mock.patch.object(adapter, "qk_norm_rope", side_effect=AssertionError("fused step must not use the module path")), \
-                                mock.patch.object(decode_step, "qkv_norm_rope_cache", wraps=decode_step.qkv_norm_rope_cache) as call:
+                        with mock.patch.object(adapter, "qk_norm_rope", wraps=qk_norm_rope) as call:
                             actual = state.step()
                             self.assertEqual(call.call_count, 2)
                 self.assertEqual(pointers, [t.data_ptr() for t in buffers])

@@ -8,7 +8,6 @@ from kernels.qk_norm_rope import qk_norm_rope
 
 
 class DecodeQKNormRoPE(Qwen3Attention):
-    @torch.no_grad()
     def __init__(self, reference):
         # Reuse all modules and metadata; do not allocate or initialize weights.
         torch.nn.Module.__init__(self)
@@ -19,15 +18,6 @@ class DecodeQKNormRoPE(Qwen3Attention):
         ):
             setattr(self, name, getattr(reference, name))
         self.train(reference.training)
-        # One [q | k | v] projection for the fused decode step. The three modules
-        # keep row views of it, so prefill and the state dict see the same values
-        # without a second copy of the weights.
-        self.qkv_weight = torch.cat((self.q_proj.weight, self.k_proj.weight, self.v_proj.weight))
-        start = 0
-        for module in (self.q_proj, self.k_proj, self.v_proj):
-            stop = start + module.weight.shape[0]
-            module.weight = torch.nn.Parameter(self.qkv_weight[start:stop], requires_grad=False)
-            start = stop
 
     def forward(self, hidden_states, position_embeddings, attention_mask,
                 past_key_value=None, cache_position=None, **kwargs):
