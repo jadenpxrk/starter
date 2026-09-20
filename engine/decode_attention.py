@@ -9,6 +9,13 @@ def grouped_decode_attention(
     module, query, key, value, attention_mask, dropout=0.0, scaling=None,
     is_causal=None, **kwargs,
 ):
+    context = kwargs.pop("_flash_decode_context", None)
+    if context is not None:
+        # Only DecodeState.step supplies this context and its exact prefix mask.
+        # Do not reinterpret an arbitrary user mask as sequence lengths.
+        if dropout != 0.0 or is_causal:
+            raise ValueError("Flash decode context requires noncausal, dropout-free attention")
+        return context.attention(query, key, value, attention_mask, scaling), None
     # This is only valid when every query head has the same visibility mask.
     # In particular, never fold the heads of a multi-token prefill into time.
     if (

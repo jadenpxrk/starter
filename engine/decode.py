@@ -14,11 +14,12 @@ class StaticKVCache(StaticCache):
         return cached
 
 
-def qwen_forward(model, input_ids, cache, positions, attention_mask=None):
+def qwen_forward(model, input_ids, cache, positions, attention_mask=None, flash_context=None):
     base = model.model
     x = base.embed_tokens(input_ids)
     position_ids = positions.unsqueeze(0)
     position_embeddings = base.rotary_emb(x, position_ids)
+    extra = {} if flash_context is None else {"_flash_decode_context": flash_context}
     for layer in base.layers:
         x = layer(
             x,
@@ -28,6 +29,7 @@ def qwen_forward(model, input_ids, cache, positions, attention_mask=None):
             use_cache=True,
             cache_position=positions,
             position_embeddings=position_embeddings,
+            **extra,
         )[0]
     return model.lm_head(base.norm(x[:, -1:, :]))
 
@@ -48,6 +50,10 @@ class DecodeState:
         self.position = torch.zeros(1, dtype=torch.int64, device=model.device)
         self.key_positions = torch.arange(capacity, device=model.device)
         self.graph = None
+        self.flash_context = None
+        if model.device.type == "cuda":
+            from flash_decode import make_flash_context
+            self.flash_context = make_flash_context(model, batch_size, max_new_tokens, self.key_positions)
 
     def prefill(self, input_ids):
         prompt_length = input_ids.shape[1]
@@ -63,8 +69,10 @@ class DecodeState:
         return logits
 
     def step(self):
-        mask = (self.key_positions <= self.position).view(1, 1, 1, -1)
-        logits = qwen_forward(self.model, self.tokens, self.cache, self.position, mask)
+        mask = ((self.key_positions <= self.position).view(1, 1, 1, -1)
+                if self.flash_context is None else self.flash_context.prepare(self.position))
+        logits = qwen_forward(self.model, self.tokens, self.cache, self.position, mask,
+                              flash_context=self.flash_context)
         self.tokens.copy_(logits[:, -1, :].argmax(dim=-1, keepdim=True))
         self.position.add_(1)
         return logits
