@@ -135,8 +135,10 @@ class CpuKernelBodies:
     def __init__(self):
         self.ops = Ops()
         env = source_functions(KERNELS / "skinny_gemm.py",
-                               {"_partials_kernel", "_silu_mul_kernel"}, {"tl": self.ops})
+                               {"_partials_kernel", "_silu_mul_kernel", "_qkv_head_kernel"},
+                               {"tl": self.ops})
         self.partials, self.silu = env["_partials_kernel"], env["_silu_mul_kernel"]
+        self.qkv_head = env["_qkv_head_kernel"]
 
     def run_partials(self, x, w, splits, bm):
         m, k = x.shape
@@ -150,6 +152,23 @@ class CpuKernelBodies:
         assert bool((pp.writes == 1).all()), "every partial written exactly once"
         assert bool((xp.writes == 0).all()) and bool((wp.writes == 0).all())
         return out
+
+    def run_qkv_head(self, x, w, qw, kw, cos, sin, position, keys, values, bm, eps=(1e-6, 1e-6)):
+        m, k = x.shape
+        batch, nk, capacity, d = keys.shape
+        nq = w.shape[0] // d - 2 * nk
+        q = torch.full((m, nq, 1, d), float("nan")).bfloat16()
+        pointers = [Pointer(t) for t in (x, w, qw, kw, cos, sin, position, q, keys, values)]
+        for head in range(nq + 2 * nk):
+            self.ops.program = (head, 0)
+            self.qkv_head(*pointers, m, k, capacity, nq, nk, d, eps[0], eps[1], bm, BK)
+        assert bool((pointers[7].writes == 1).all()), "every Q value written exactly once"
+        slot = torch.zeros(batch, nk, capacity, d, dtype=torch.int64)
+        slot[:, :, int(position)] = 1
+        for pointer in pointers[8:]:
+            assert torch.equal(pointer.writes.view_as(slot), slot), "only the current slot is written"
+        assert all(bool((pointer.writes == 0).all()) for pointer in pointers[:7]), "inputs are read-only"
+        return q
 
     def run_silu(self, x, w, bm):
         m, k = x.shape
@@ -166,6 +185,31 @@ class CpuKernelBodies:
 def reference_silu_mul(x, w):
     gate, up = F.linear(x.float(), w.float()).to(torch.bfloat16).chunk(2, dim=-1)
     return (F.silu(gate.float()).to(torch.bfloat16).float() * up.float()).to(torch.bfloat16)
+
+
+def restate_qkv_head(projection, qw, kw, cos, sin, position, nq, nk, d, eps=(1e-6, 1e-6)):
+    """The fused epilogue's cast chain in Torch: per-head halves, same order.
+
+    Returns (q [B,Nq,1,D], k [B,Nkv,D], v [B,Nkv,D]) in BF16 from a BF16 projection.
+    """
+    batch = projection.shape[0]
+    rows = projection.float().view(batch, nq + 2 * nk, d)
+    left, right = rows[..., :d // 2], rows[..., d // 2:]
+    outs = []
+    for kind, (gain, e) in enumerate(((qw, eps[0]), (kw, eps[1]))):
+        sel = slice(0, nq) if kind == 0 else slice(nq, nq + nk)
+        l, r = left[:, sel], right[:, sel]
+        inv = torch.rsqrt(((l * l).sum(-1) + (r * r).sum(-1)) / d + e)
+        nl = (l * inv[..., None]).bfloat16().float()
+        nr = (r * inv[..., None]).bfloat16().float()
+        nl = (nl * gain[:d // 2].float()).bfloat16().float()
+        nr = (nr * gain[d // 2:].float()).bfloat16().float()
+        c, si = cos[position].float(), sin[position].float()
+        ol = (nl * c[:d // 2]).bfloat16().float() + (-nr * si[:d // 2]).bfloat16().float()
+        orr = (nr * c[d // 2:]).bfloat16().float() + (nl * si[d // 2:]).bfloat16().float()
+        outs.append(torch.cat((ol, orr), -1).bfloat16())
+    v = rows[:, nq + nk:].bfloat16()
+    return outs[0].unsqueeze(2), outs[1], v
 
 
 def sum_partials_bf16(partials):
@@ -247,6 +291,84 @@ class SkinnyCPU(unittest.TestCase):
         gate, up = F.linear(x.float(), w.float()).chunk(2, dim=-1)
         unrounded = (F.silu(gate) * up).to(torch.bfloat16)
         self.assertFalse(torch.equal(unrounded, reference_silu_mul(x, w)))
+
+    def test_kernel_body_fused_qkv_head_epilogue(self):
+        """Fused head body: rounded projection -> norm -> gain -> RoPE -> Q or cache slot."""
+        torch.manual_seed(10)
+        bodies = CpuKernelBodies()
+        ops = Ops()
+        consumer = source_functions(KERNELS / "decode_fused.py", {"_qkv_norm_rope_cache_kernel"},
+                                    {"tl": ops})["_qkv_norm_rope_cache_kernel"]
+        from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
+        for batch, nq, nk, d, k, bm in ((3, 4, 2, 32, 128, 16), (1, 2, 1, 128, 64, 16),
+                                        (17, 3, 1, 32, 64, 32)):
+            with self.subTest(batch=batch, nq=nq, nk=nk, d=d, k=k):
+                capacity, position = 5, torch.tensor([3])
+                x = torch.randn(batch, k).bfloat16()
+                w = torch.randn((nq + 2 * nk) * d, k).bfloat16() / k ** 0.5
+                qw, kw = torch.randn(d).bfloat16(), torch.randn(d).bfloat16()
+                cos, sin = torch.randn(capacity, d).bfloat16(), torch.randn(capacity, d).bfloat16()
+                keys = torch.full((batch, nk, capacity, d), 33.).bfloat16()
+                values = keys.clone()
+                q = bodies.run_qkv_head(x, w, qw, kw, cos, sin, position, keys, values, bm)
+                self.assertEqual(q.shape, (batch, nq, 1, d))
+                self.assertTrue(bool(torch.isfinite(q).all()))
+                projection = F.linear(x.float(), w.float()).bfloat16()
+                # Exact against the restated chain from the same BF16 projection.
+                eq, ek, ev = restate_qkv_head(projection, qw, kw, cos, sin, 3, nq, nk, d)
+                torch.testing.assert_close(q, eq, rtol=0, atol=0)
+                torch.testing.assert_close(keys[:, :, 3], ek, rtol=0, atol=0)
+                torch.testing.assert_close(values[:, :, 3], ev, rtol=0, atol=0)
+                # Same function as the split-K consumer body, up to the FP32 norm reduction order.
+                ck = torch.full_like(keys, 33.)
+                cv = torch.full_like(values, 33.)
+                cq = torch.empty_like(q)
+                width = (nq + 2 * nk) * d
+                pointers = [Pointer(t) for t in (projection, qw, kw, cos, sin, position, cq, ck, cv)]
+                for row in range(batch * (nq + nk)):
+                    ops.program = (row, 0)
+                    consumer(*pointers, width, capacity, batch * width, nq, nk, d, 1e-6, 1e-6, 0)
+                torch.testing.assert_close(q, cq, rtol=1e-2, atol=1e-2)
+                torch.testing.assert_close(keys, ck, rtol=1e-2, atol=1e-2)
+                torch.testing.assert_close(values, cv, rtol=0, atol=0)
+                # Native formula: per-head RMSNorm with gain, then HF rotary at the slot.
+                pq, pk, pv = projection.split([nq * d, nk * d, nk * d], dim=-1)
+                norm = lambda t, g: (t.float() * torch.rsqrt(t.float().pow(2).mean(-1, keepdim=True)
+                                                              + 1e-6)).bfloat16() * g
+                nq_, nk_ = apply_rotary_pos_emb(norm(pq.view(batch, nq, 1, d), qw),
+                                                norm(pk.view(batch, nk, 1, d), kw),
+                                                cos[3].view(1, 1, d), sin[3].view(1, 1, d))
+                torch.testing.assert_close(q, nq_, rtol=2e-2, atol=2e-2)
+                torch.testing.assert_close(keys[:, :, 3], nk_[:, :, 0], rtol=2e-2, atol=2e-2)
+                torch.testing.assert_close(values[:, :, 3], pv.view(batch, nk, d), rtol=0, atol=0)
+                self.assertTrue(bool((keys[:, :, :3] == 33).all()) and bool((keys[:, :, 4:] == 33).all()))
+        # Negative control: an unrounded projection is a different function of the same inputs.
+        unrounded = F.linear(x.float(), w.float())
+        with self.assertRaises(AssertionError):
+            torch.testing.assert_close(
+                q, restate_qkv_head(unrounded, qw, kw, cos, sin, 3, nq, nk, d)[0], rtol=0, atol=0)
+
+    def test_supports_qkv_is_static_and_wrapper_validates(self):
+        x, w = fake((4, 2560)), fake((6144, 2560))
+        keys = fake((4, 8, 600, 128))
+        self.assertTrue(skinny.supports_qkv(x, w, keys))
+        self.assertTrue(skinny.supports_qkv(fake((skinny.MAX_ROWS, 2560)), w, fake((64, 8, 9, 128))))
+        for bad_x, bad_w, bad_keys in (
+                (fake((skinny.MAX_ROWS + 1, 2560)), w, fake((65, 8, 600, 128))),
+                (x, w, fake((5, 8, 600, 128))),           # cache batch differs from rows
+                (x, w, fake((4, 8, 600, 64))),            # head width is not 128
+                (x, fake((6144 + 32, 2560)), keys),       # rows are not whole heads
+                (x, fake((2048, 2560)), keys),            # no query heads left
+                (x, w, fake((4, 600, 128))),              # not [B, Nkv, C, D]
+                (fake((4, 2560), cuda=False), fake((6144, 2560), cuda=False), fake((4, 8, 600, 128), cuda=False)),
+                (x, fake((6144, 2560), contiguous=False), keys)):
+            self.assertFalse(skinny.supports_qkv(bad_x, bad_w, bad_keys))
+        # The wrapper refuses CPU tensors before any launch.
+        cpu = torch.zeros(2, 64, dtype=torch.bfloat16)
+        with self.assertRaises(ValueError):
+            skinny.linear_qkv_norm_rope_cache(cpu, torch.zeros(6 * 128, 64, dtype=torch.bfloat16),
+                                              None, None, 0, 0, None, None, None,
+                                              torch.zeros(2, 2, 3, 128, dtype=torch.bfloat16), None)
 
     def test_consumer_kernels_add_partials_then_round_once(self):
         """Run the modified consumer bodies with SPLITS=0 and SPLITS=S on CPU."""
@@ -343,7 +465,8 @@ class SkinnyCPU(unittest.TestCase):
         try:
             with mock.patch.dict(sys.modules, {
                     "kernels.qk_norm_rope": mock.Mock(), "kernels.decode_fused": mock.Mock(),
-                    "kernels.skinny_gemm": mock.Mock(supports=mock.Mock(return_value=False))}):
+                    "kernels.skinny_gemm": mock.Mock(supports=mock.Mock(return_value=False),
+                                             supports_qkv=mock.Mock(return_value=False))}):
                 import decode_step
                 import qk_norm_rope as adapter
             from decode import DecodeState
@@ -406,11 +529,18 @@ class SkinnyCPU(unittest.TestCase):
             values.index_copy_(2, position, v.reshape(batch, kv_heads, 1, width))
             return q.contiguous()
 
-        calls = {"partials": 0, "silu": 0, "supports": 0}
+        calls = {"partials": 0, "silu": 0, "supports": 0, "qkv": 0}
 
         def supports(x, weight, pairs=False):
             calls["supports"] += 1
             return x.ndim == 2 and weight.ndim == 2 and x.shape[0] <= 64
+
+        def supports_qkv(x, weight, keys):
+            return supports(x, weight) and keys.ndim == 4 and keys.shape[0] == x.shape[0]
+
+        def linear_qkv_norm_rope_cache(x, weight, *args):
+            calls["qkv"] += 1
+            return qkv_norm_rope_cache(F.linear(x, weight), *args)
 
         def linear_silu_mul(x, weight):
             calls["silu"] += 1
@@ -425,8 +555,10 @@ class SkinnyCPU(unittest.TestCase):
             mock.patch.object(decode_step, "linear_partials", side_effect=linear_partials),
             mock.patch.object(decode_step, "linear_silu_mul", side_effect=linear_silu_mul),
             mock.patch.object(decode_step, "add_rms_norm", side_effect=add_rms_norm),
-            mock.patch.object(decode_step, "qkv_norm_rope_cache", side_effect=qkv_norm_rope_cache),
+            mock.patch.object(decode_step, "qkv_norm_rope_cache", side_effect=AssertionError("split Q/K/V path")),
             mock.patch.object(decode_step, "silu_mul", side_effect=AssertionError("unfused MLP path")),
+            mock.patch.object(decode_step, "supports_qkv", side_effect=supports_qkv),
+            mock.patch.object(decode_step, "linear_qkv_norm_rope_cache", side_effect=linear_qkv_norm_rope_cache),
         )
         for batch, length, count in ((1, 3, 3), (3, 7, 4)):
             with self.subTest(batch=batch, length=length):
@@ -443,10 +575,12 @@ class SkinnyCPU(unittest.TestCase):
                     current, cache = state.tokens.clone(), expected.past_key_values
                     if step + 1 < count:
                         before = dict(calls)
-                        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+                        with (patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],
+                              patches[6], patches[7]):
                             logits = state.step()
                         layers = config.num_hidden_layers
-                        self.assertEqual(calls["partials"] - before["partials"], 3 * layers)
+                        self.assertEqual(calls["partials"] - before["partials"], 2 * layers)
+                        self.assertEqual(calls["qkv"] - before["qkv"], layers)
                         self.assertEqual(calls["silu"] - before["silu"], layers)
 
 
@@ -523,6 +657,44 @@ class SkinnyCUDA(unittest.TestCase):
             results.append((q, keys, values))
         for a, b in zip(*results):
             torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+    @torch.inference_mode()
+    def test_fused_qkv_head_matches_split_consumer_and_slots(self):
+        torch.manual_seed(25)
+        nq, nk, d, k, capacity = 32, 8, 128, 2560, 9
+        w = torch.randn((nq + 2 * nk) * d, k, device="cuda", dtype=torch.bfloat16) / k ** 0.5
+        qw, kw = (torch.randn(d, device="cuda", dtype=torch.bfloat16) for _ in range(2))
+        cos, sin = (torch.randn(capacity, d, device="cuda", dtype=torch.bfloat16) for _ in range(2))
+        for m in (1, 4, 16, 33, 64):
+            for slot in (0, 5, capacity - 1):
+                with self.subTest(m=m, slot=slot):
+                    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+                    position = torch.tensor([slot], device="cuda")
+                    before = (x.clone(), w.clone())
+                    keys = torch.full((m, nk, capacity, d), 33., device="cuda", dtype=torch.bfloat16)
+                    values = keys.clone()
+                    self.assertTrue(skinny.supports_qkv(x, w, keys))
+                    q = skinny.linear_qkv_norm_rope_cache(x, w, qw, kw, 1e-6, 1e-6, cos, sin,
+                                                          position, keys, values)
+                    self.assertEqual(q.shape, (m, nq, 1, d))
+                    self.assertTrue(bool(torch.isfinite(q).all()))
+                    for t, old in zip((x, w), before):
+                        torch.testing.assert_close(t, old, rtol=0, atol=0)
+                    untouched = torch.ones(capacity, dtype=torch.bool, device="cuda")
+                    untouched[slot] = False
+                    self.assertTrue(bool((keys[:, :, untouched] == 33).all()))
+                    self.assertTrue(bool((values[:, :, untouched] == 33).all()))
+                    # Split-K partials and full-K accumulation differ only in FP32 order.
+                    for source in (skinny.linear_partials(x, w), F.linear(x, w)):
+                        ek = torch.full_like(keys, 33.)
+                        ev = torch.full_like(values, 33.)
+                        eq = fused.qkv_norm_rope_cache(source, qw, kw, 1e-6, 1e-6, cos, sin,
+                                                       position, ek, ev)
+                        torch.testing.assert_close(q, eq, rtol=2e-2, atol=2e-2)
+                        torch.testing.assert_close(keys, ek, rtol=2e-2, atol=2e-2)
+                        torch.testing.assert_close(values, ev, rtol=2e-2, atol=2e-2)
+                    torch.testing.assert_close(values[:, :, slot].reshape(m, -1),
+                                               F.linear(x, w)[:, (nq + nk) * d:], rtol=1.6e-2, atol=1e-2)
 
     @torch.inference_mode()
     def test_graph_replay_follows_fresh_inputs(self):

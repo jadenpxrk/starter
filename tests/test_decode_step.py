@@ -24,7 +24,8 @@ else:
     with mock.patch.dict(sys.modules, {
             "kernels.qk_norm_rope": mock.Mock(), "kernels.decode_fused": mock.Mock(),
             # The static shape rule keeps F.linear here, exactly as on a CPU device.
-            "kernels.skinny_gemm": mock.Mock(supports=mock.Mock(return_value=False))}):
+            "kernels.skinny_gemm": mock.Mock(supports=mock.Mock(return_value=False),
+                                             supports_qkv=mock.Mock(return_value=False))}):
         import decode_step
         import qk_norm_rope as adapter
 import decode

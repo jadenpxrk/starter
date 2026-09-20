@@ -208,6 +208,7 @@ def cpu_forward():
         return F.silu(g) * u
     return bodies(ENGINE / "decode_step.py", {"_project", "_mlp_hidden", "fused_decode_forward"},
                   {"torch": torch, "F": F, "supports": lambda *a, **k: False,
+                   "supports_qkv": lambda *a: False,
                    "linear_partials": None, "linear_silu_mul": None,
                    "add_rms_norm": add_norm, "qkv_norm_rope_cache": ref_qkv,
                    "silu_mul": silu_mul})["fused_decode_forward"]
