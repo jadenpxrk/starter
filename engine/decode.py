@@ -48,6 +48,7 @@ class DecodeState:
         self.position = torch.zeros(1, dtype=torch.int64, device=model.device)
         self.key_positions = torch.arange(capacity, device=model.device)
         self.graph = None
+        self.linear_policy = "torch"
 
     def prefill(self, input_ids):
         prompt_length = input_ids.shape[1]
@@ -64,7 +65,16 @@ class DecodeState:
 
     def step(self):
         mask = (self.key_positions <= self.position).view(1, 1, 1, -1)
-        logits = qwen_forward(self.model, self.tokens, self.cache, self.position, mask)
+        plan = getattr(self.model, "decode_linear_plan", None)
+        if plan is None:
+            logits = qwen_forward(self.model, self.tokens, self.cache, self.position, mask)
+        else:
+            old_active, old_policy = plan.active, plan.policy
+            plan.active, plan.policy = True, self.linear_policy
+            try:
+                logits = qwen_forward(self.model, self.tokens, self.cache, self.position, mask)
+            finally:
+                plan.active, plan.policy = old_active, old_policy
         self.tokens.copy_(logits[:, -1, :].argmax(dim=-1, keepdim=True))
         self.position.add_(1)
         return logits
@@ -72,6 +82,15 @@ class DecodeState:
     def capture(self):
         tokens = self.tokens.clone()
         position = self.position.clone()
+        plan = getattr(self.model, "decode_linear_plan", None)
+        if plan is None:
+            self.graph = self._capture_graph(tokens, position)
+        else:
+            self.graph, self.linear_policy = plan.capture(self, tokens, position)
+        self.tokens.copy_(tokens)
+        self.position.copy_(position)
+
+    def _capture_graph(self, tokens, position):
         current_stream = torch.cuda.current_stream()
         warmup_stream = torch.cuda.Stream()
         warmup_stream.wait_stream(current_stream)
@@ -83,8 +102,10 @@ class DecodeState:
         current_stream.wait_stream(warmup_stream)
         self.tokens.copy_(tokens)
         self.position.copy_(position)
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph, stream=warmup_stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=warmup_stream):
             self.step()
+        current_stream.wait_stream(warmup_stream)
         self.tokens.copy_(tokens)
         self.position.copy_(position)
+        return graph
